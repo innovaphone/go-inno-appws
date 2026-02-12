@@ -299,6 +299,9 @@ func (c *Client) Subscribe(ctx context.Context, api, mt, src string, payload any
 }
 
 func (c *Client) write(ctx context.Context, data []byte) error {
+	if c.cfg.Debug != nil {
+		fmt.Fprintf(c.cfg.Debug, ">>> %s\n", data)
+	}
 	deadline := deadlineFromContext(ctx, c.defaultTimeout)
 	if !deadline.IsZero() {
 		_ = c.conn.SetWriteDeadline(deadline)
@@ -332,6 +335,9 @@ func (c *Client) readLoop(backlog [][]byte) {
 		if err != nil {
 			c.fail(err)
 			return
+		}
+		if c.cfg.Debug != nil {
+			fmt.Fprintf(c.cfg.Debug, "<<< %s\n", data)
 		}
 		c.handleMessage(data)
 	}
@@ -496,12 +502,17 @@ func (pr *pendingRequest) deliver(res pendingResult) {
 }
 
 func performHandshake(ctx context.Context, conn *websocket.Conn, cfg Config, timeout time.Duration) (string, [][]byte, error) {
+	appObj := cfg.PbxObj
+	if appObj == "" {
+		appObj = cfg.App
+	}
 	challengeMsg := map[string]any{
 		"mt":     mtAppChallenge,
-		"appObj": cfg.App,
+		"appObj": appObj,
 	}
-	if cfg.SIP != "" {
-		challengeMsg["user"] = cfg.SIP
+	if cfg.Debug != nil {
+		data, _ := marshalNoEscape(challengeMsg)
+		fmt.Fprintf(cfg.Debug, ">>> %s\n", data)
 	}
 	if err := writeJSONWithTimeout(ctx, conn, timeout, challengeMsg); err != nil {
 		return "", nil, fmt.Errorf("appws: send AppChallenge: %w", err)
@@ -514,6 +525,9 @@ func performHandshake(ctx context.Context, conn *websocket.Conn, cfg Config, tim
 		base, raw, err := readMessageWithTimeout(ctx, conn, timeout)
 		if err != nil {
 			return "", nil, fmt.Errorf("appws: read AppChallengeResult: %w", err)
+		}
+		if cfg.Debug != nil {
+			fmt.Fprintf(cfg.Debug, "<<< %s\n", raw)
 		}
 		if base.MT != mtAppChallengeResp {
 			backlog = append(backlog, raw)
@@ -536,6 +550,10 @@ func performHandshake(ctx context.Context, conn *websocket.Conn, cfg Config, tim
 	if err != nil {
 		return "", nil, err
 	}
+	if cfg.Debug != nil {
+		data, _ := marshalNoEscape(loginMsg)
+		fmt.Fprintf(cfg.Debug, ">>> %s\n", data)
+	}
 	if err := writeJSONWithTimeout(ctx, conn, timeout, loginMsg); err != nil {
 		return "", nil, fmt.Errorf("appws: send AppLogin: %w", err)
 	}
@@ -544,6 +562,9 @@ func performHandshake(ctx context.Context, conn *websocket.Conn, cfg Config, tim
 		base, raw, err := readMessageWithTimeout(ctx, conn, timeout)
 		if err != nil {
 			return "", nil, fmt.Errorf("appws: read AppLoginResult: %w", err)
+		}
+		if cfg.Debug != nil {
+			fmt.Fprintf(cfg.Debug, "<<< %s\n", raw)
 		}
 		if base.MT == mtAppLoginResp {
 			var res struct {
@@ -555,15 +576,17 @@ func performHandshake(ctx context.Context, conn *websocket.Conn, cfg Config, tim
 			if err := json.Unmarshal(raw, &res); err != nil {
 				return "", nil, fmt.Errorf("appws: decode AppLoginResult: %w", err)
 			}
-			if !res.OK {
+			// Check for explicit error first
+			if res.Error != "" || res.ErrorText != "" {
 				reason := res.ErrorText
 				if reason == "" {
 					reason = res.Error
 				}
-				if reason == "" {
-					reason = "login rejected"
-				}
 				return "", nil, fmt.Errorf("appws: login failed: %s", reason)
+			}
+			// Must have ok:true for success
+			if !res.OK {
+				return "", nil, fmt.Errorf("appws: login failed: login rejected")
 			}
 			return sessionKey, backlog, nil
 		}
@@ -581,12 +604,14 @@ func buildLoginMessage(cfg Config, challenge string) (map[string]any, string, er
 		infoString = string(b)
 	}
 
+	// Digest always includes all 5 base fields (app, domain, sip, guid, dn) even if empty
 	parts := []string{cfg.App, cfg.Domain, cfg.SIP, cfg.GUID, cfg.DN}
 	if infoString != "" {
 		parts = append(parts, infoString)
 	}
 	parts = append(parts, challenge, cfg.Password)
-	sum := sha256.Sum256([]byte(strings.Join(parts, ":")))
+	digestInput := strings.Join(parts, ":")
+	sum := sha256.Sum256([]byte(digestInput))
 	digest := hex.EncodeToString(sum[:])
 
 	keySource := "innovaphoneAppSessionKey:" + challenge + ":" + cfg.Password
@@ -596,16 +621,22 @@ func buildLoginMessage(cfg Config, challenge string) (map[string]any, string, er
 		"mt":     mtAppLogin,
 		"app":    cfg.App,
 		"domain": cfg.Domain,
-		"sip":    cfg.SIP,
-		"guid":   cfg.GUID,
-		"dn":     cfg.DN,
 		"digest": digest,
-		"key":    sessionKey,
-		"pbxObj": cfg.App,
+	}
+	// Only include non-empty optional fields
+	if cfg.SIP != "" {
+		login["sip"] = cfg.SIP
+	}
+	if cfg.GUID != "" {
+		login["guid"] = cfg.GUID
+	}
+	if cfg.DN != "" {
+		login["dn"] = cfg.DN
 	}
 	if cfg.Info != nil {
 		login["info"] = cfg.Info
 	}
+
 	return login, sessionKey, nil
 }
 
